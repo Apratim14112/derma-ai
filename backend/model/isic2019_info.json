@@ -1,0 +1,7 @@
+{
+  "dataset": "isic2019",
+  "image_size": 256,
+  "channels": 3,
+  "num_classes": 8,
+  "confidence_boost": 0.8
+}

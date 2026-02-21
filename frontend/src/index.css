@@ -1,0 +1,54 @@
+:root {
+  font-family: 'Space Grotesk', 'Segoe UI', sans-serif;
+  color: #24302b;
+  background-color: #f8faf9;
+  --ink: #24302b;
+  --muted: #7a8a83;
+  --accent: #4f7663;
+  --accent-2: #a7c4b5;
+  --accent-3: #2f4a3d;
+  --paper: #ffffff;
+  --panel: #f2f6f4;
+  --shadow: rgba(15, 23, 42, 0.08);
+  --border: rgba(15, 23, 42, 0.12);
+  --success: #2e7d63;
+  --warn: #b37a3b;
+}
+
+[data-theme='dark'] {
+  color: #e6e6e6;
+  background-color: #0b0f10;
+  --ink: #e6e6e6;
+  --muted: #a1a8b3;
+  --accent: #2dd4bf;
+  --accent-2: #f59e0b;
+  --accent-3: #0c3b38;
+  --paper: #11161a;
+  --panel: #0f1418;
+  --shadow: rgba(0, 0, 0, 0.5);
+  --border: rgba(255, 255, 255, 0.12);
+  --success: #4ade80;
+  --warn: #f59e0b;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: radial-gradient(circle at top left, #f8faf9 0%, #f1f6f3 45%, #e9f1ed 100%);
+}
+
+[data-theme='dark'] body {
+  background: radial-gradient(circle at top left, #0f1718 0%, #0b0f10 45%, #0b1215 100%);
+}
+
+img {
+  max-width: 100%;
+  display: block;
+}
+
+button {
+  font-family: inherit;
+}

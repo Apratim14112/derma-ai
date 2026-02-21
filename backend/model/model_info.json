@@ -1,0 +1,6 @@
+{
+  "dataset": "dermamnist",
+  "image_size": 28,
+  "channels": 3,
+  "num_classes": 7
+}

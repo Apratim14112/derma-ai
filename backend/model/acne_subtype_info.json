@@ -1,0 +1,8 @@
+{
+  "dataset": "acne_subtype",
+  "image_size": 256,
+  "channels": 3,
+  "num_classes": 3,
+  "temperature": 0.75,
+  "confidence_boost": 1.0
+}

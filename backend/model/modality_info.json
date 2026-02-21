@@ -1,0 +1,6 @@
+{
+  "dataset": "modality",
+  "image_size": 224,
+  "channels": 3,
+  "num_classes": 2
+}

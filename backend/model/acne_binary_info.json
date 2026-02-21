@@ -1,0 +1,14 @@
+{
+  "dataset": "sd198_acne_binary",
+  "image_size": 256,
+  "channels": 3,
+  "num_classes": 2,
+  "acne_classes": [
+    "Acne_Keloidalis_Nuchae",
+    "Acne_Vulgaris",
+    "Perioral_Dermatitis",
+    "Pityrosporum_Folliculitis",
+    "Pomade_Acne",
+    "Rosacea"
+  ]
+}
