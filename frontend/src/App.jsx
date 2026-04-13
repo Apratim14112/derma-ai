@@ -2,6 +2,9 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import './App.css'
 
 const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:5000'
+const IPFS_GATEWAY_BASE = 'https://gateway.pinata.cloud/ipfs/'
+const SEPOLIA_TX_BASE = 'https://sepolia.etherscan.io/tx/'
+const AUTH_TOKEN_KEY = 'auth_token'
 
 const formatPercent = (value) => `${Math.round(value * 100)}%`
 const clamp = (value, min, max) => Math.min(Math.max(value, min), max)
@@ -50,6 +53,58 @@ const getDiseaseInfo = (label) => {
   return `${formatLabel(label)} is a model-predicted skin condition label. This result is educational only, not a diagnosis. If symptoms are persistent, painful, bleeding, or worsening, seek in-person evaluation from a dermatologist.`
 }
 
+const normalizePredictResponse = (data) => {
+  const safeTop5 = Array.isArray(data?.top5) ? data.top5 : []
+  const safeTop3 = Array.isArray(data?.top3) && data.top3.length > 0 ? data.top3 : safeTop5.slice(0, 3)
+
+  const topPrediction =
+    typeof data?.prediction === 'object' && data?.prediction !== null
+      ? data.prediction
+      : safeTop5[0] || {
+          index: -1,
+          label: typeof data?.prediction === 'string' ? data.prediction : 'Unknown',
+          probability: 0
+        }
+
+  const top5Combined =
+    typeof data?.top5_combined === 'number'
+      ? data.top5_combined
+      : safeTop5.slice(0, 5).reduce((sum, item) => sum + (Number(item?.probability) || 0), 0)
+
+  const modelMeta =
+    data?.model && typeof data.model === 'object'
+      ? data.model
+      : {
+          name: data?.used_model || 'unknown',
+          version: data?.model_version || 'v1.0'
+        }
+
+  return {
+    ...data,
+    prediction: topPrediction,
+    top3: safeTop3,
+    top5: safeTop5,
+    top5_combined: top5Combined,
+    model: modelMeta
+  }
+}
+
+const readReportsFromStorage = () => {
+  try {
+    const raw = localStorage.getItem('reports')
+    if (!raw) return []
+    const parsed = JSON.parse(raw)
+    return Array.isArray(parsed) ? parsed : []
+  } catch {
+    return []
+  }
+}
+
+const isReportReady = (report) =>
+  !!(report?.json_cid && report?.pdf_cid && report?.hash && report?.tx_hash)
+
+
+
 export default function App() {
   const [file, setFile] = useState(null)
   const [preview, setPreview] = useState(null)
@@ -67,8 +122,269 @@ export default function App() {
   const [history, setHistory] = useState([])
   const [skinCloseupWarning, setSkinCloseupWarning] = useState(false)
   const [diseaseInfoOpen, setDiseaseInfoOpen] = useState(null)
+  const [showFullHistory, setShowFullHistory] = useState(false)
+  const [openHistoryRows, setOpenHistoryRows] = useState({})
+  const [authMode, setAuthMode] = useState('login')
+  const [authEmail, setAuthEmail] = useState('')
+  const [authPassword, setAuthPassword] = useState('')
+  const [authToken, setAuthToken] = useState(() => localStorage.getItem(AUTH_TOKEN_KEY) || '')
+  const [authUser, setAuthUser] = useState(null)
+  const [authLoading, setAuthLoading] = useState(false)
+  const [authError, setAuthError] = useState('')
+  const [verificationByReportId, setVerificationByReportId] = useState({})
   const videoRef = useRef(null)
   const streamRef = useRef(null)
+  const previousUserIdRef = useRef(null)
+  const [reports, setReports] = useState(() => readReportsFromStorage())
+
+  const resetAnalysisView = () => {
+    if (preview) {
+      URL.revokeObjectURL(preview)
+    }
+    setFile(null)
+    setPreview(null)
+    setResult(null)
+    setError('')
+    setHistory([])
+    setSkinCloseupWarning(false)
+    setDiseaseInfoOpen(null)
+    setOpenHistoryRows({})
+  }
+
+  const fetchMyReports = async (token) => {
+    if (!token) return
+    const response = await fetch(`${API_URL}/api/reports`, {
+      headers: { Authorization: `Bearer ${token}` }
+    })
+    const data = await response.json()
+    if (!response.ok) {
+      throw new Error(data.error || 'Unable to load reports')
+    }
+    const rows = Array.isArray(data?.reports) ? data.reports : []
+    setReports(rows)
+    localStorage.setItem('reports', JSON.stringify(rows))
+  }
+
+  const loadAuthProfile = async (token) => {
+    const response = await fetch(`${API_URL}/api/auth/me`, {
+      headers: { Authorization: `Bearer ${token}` }
+    })
+    const data = await response.json()
+    if (!response.ok) {
+      throw new Error(data.error || 'Session expired')
+    }
+    setAuthUser(data.user || null)
+    await fetchMyReports(token)
+  }
+
+  const handleAuthSubmit = async (event) => {
+    event.preventDefault()
+    setAuthLoading(true)
+    setAuthError('')
+    try {
+      const endpoint = authMode === 'register' ? '/api/auth/register' : '/api/auth/login'
+      const response = await fetch(`${API_URL}${endpoint}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: authEmail, password: authPassword })
+      })
+      const data = await response.json()
+      if (!response.ok) {
+        throw new Error(data.error || 'Authentication failed')
+      }
+      const token = data?.token || ''
+      setAuthToken(token)
+      localStorage.setItem(AUTH_TOKEN_KEY, token)
+      setAuthUser(data?.user || null)
+      resetAnalysisView()
+      await fetchMyReports(token)
+      setAuthPassword('')
+    } catch (err) {
+      setAuthError(err.message || 'Authentication failed')
+    } finally {
+      setAuthLoading(false)
+    }
+  }
+
+  const handleLogout = () => {
+    resetAnalysisView()
+    setAuthToken('')
+    setAuthUser(null)
+    setAuthPassword('')
+    setAuthError('')
+    localStorage.removeItem(AUTH_TOKEN_KEY)
+    const localReports = readReportsFromStorage()
+    setReports(localReports)
+  }
+
+  const saveReportMetadata = (normalized) => {
+  if (authToken) return
+
+  const entry = {
+    reportId: normalized?.reportId,
+    json_cid: normalized?.json_cid,
+    pdf_cid: normalized?.pdf_cid,
+    hash: normalized?.hash,
+    tx_hash: normalized?.tx_hash,
+    prediction: normalized?.prediction?.label || '',
+    model: normalized?.model || null,
+    timestamp: normalized?.timestamp || new Date().toISOString()
+  }
+
+  const required =
+    entry.reportId &&
+    entry.json_cid &&
+    entry.pdf_cid &&
+    entry.hash &&
+    entry.tx_hash &&
+    entry.prediction &&
+    entry.model &&
+    entry.timestamp
+
+  if (!required) return
+
+  setReports((prev) => {
+    const next = [entry, ...prev.filter((item) => item.reportId !== entry.reportId)]
+    localStorage.setItem('reports', JSON.stringify(next))
+    return next
+  })
+}
+
+  const toggleHistoryRow = (reportId) => {
+    setOpenHistoryRows((prev) => ({
+      ...prev,
+      [reportId]: !prev[reportId]
+    }))
+  }
+
+  const verifyHistoryReport = async (entry) => {
+    const reportId = entry?.reportId
+    const jsonCid = entry?.json_cid
+    if (!reportId) return
+
+    if (!jsonCid) {
+      setVerificationByReportId((prev) => ({
+        ...prev,
+        [reportId]: {
+          status: 'error',
+          message: 'Cannot verify this report because JSON CID is missing.'
+        }
+      }))
+      return
+    }
+
+    setVerificationByReportId((prev) => ({
+      ...prev,
+      [reportId]: {
+        status: 'loading',
+        message: 'Verifying report integrity...'
+      }
+    }))
+
+    try {
+      const response = await fetch(`${API_URL}/verify/${encodeURIComponent(jsonCid)}`)
+      const data = await response.json()
+
+      if (!response.ok) {
+        throw new Error(data.error || 'Verification failed.')
+      }
+
+      const status = String(data?.status || '').toLowerCase()
+      if (status === 'verified') {
+        setVerificationByReportId((prev) => ({
+          ...prev,
+          [reportId]: {
+            status: 'verified',
+            message: 'Verified'
+          }
+        }))
+      } else {
+        setVerificationByReportId((prev) => ({
+          ...prev,
+          [reportId]: {
+            status: 'tampered',
+            message: 'Tampered: the recomputed JSON hash does not match the on-chain record.'
+          }
+        }))
+      }
+    } catch (err) {
+      setVerificationByReportId((prev) => ({
+        ...prev,
+        [reportId]: {
+          status: 'error',
+          message: err.message || 'Verification failed.'
+        }
+      }))
+    }
+  }
+
+  useEffect(() => {
+    if (!authToken) return
+    loadAuthProfile(authToken).catch(() => {
+      handleLogout()
+    })
+  }, [authToken])
+
+  useEffect(() => {
+    const currentUserId = authUser?.id || null
+    if (!currentUserId) {
+      previousUserIdRef.current = null
+      return
+    }
+
+    if (previousUserIdRef.current && previousUserIdRef.current !== currentUserId) {
+      // Prevent previous account's diagnosis/report state from leaking into another account session.
+      resetAnalysisView()
+    }
+
+    previousUserIdRef.current = currentUserId
+  }, [authUser?.id])
+
+  useEffect(() => {
+    if (!result?.reportId) return
+    if (result.persistence_status === 'complete' && isReportReady(result)) {
+      saveReportMetadata(result)
+      return
+    }
+    if (result.persistence_status === 'error') return
+
+    let cancelled = false
+
+    const pollStatus = async () => {
+      try {
+        const response = await fetch(`${API_URL}/api/report-status/${result.reportId}`, {
+          headers: authToken ? { Authorization: `Bearer ${authToken}` } : undefined
+        })
+        if (!response.ok) return
+        const status = await response.json()
+        if (cancelled) return
+
+        setResult((current) => ({
+          ...current,
+          ...status,
+          persistence_status: status.persistence_status || current.persistence_status,
+          persistence_message: status.persistence_message || current.persistence_message
+        }))
+
+        if (status.persistence_status === 'complete' && isReportReady(status)) {
+          saveReportMetadata({ ...result, ...status })
+          if (authToken) {
+            fetchMyReports(authToken).catch(() => {})
+          }
+        }
+      } catch {
+        // Ignore transient polling failures; the next tick may succeed.
+      }
+    }
+
+    pollStatus()
+    const intervalId = window.setInterval(pollStatus, 3000)
+
+    return () => {
+      cancelled = true
+      window.clearInterval(intervalId)
+    }
+  }, [result?.reportId, result?.persistence_status, authToken])
 
   const statusText = useMemo(() => {
     if (loading) return 'Analyzing image...'
@@ -231,6 +547,7 @@ export default function App() {
     try {
       const response = await fetch(`${API_URL}/api/predict`, {
         method: 'POST',
+        headers: authToken ? { Authorization: `Bearer ${authToken}` } : undefined,
         body: formData
       })
       const data = await response.json()
@@ -240,7 +557,8 @@ export default function App() {
       if (preview) {
         setHistory((prev) => [preview, ...prev].slice(0, 2))
       }
-      setResult(data)
+      const normalized = normalizePredictResponse(data)
+      setResult(normalized)
     } catch (err) {
       setError(err.message || 'Prediction failed')
     } finally {
@@ -249,7 +567,7 @@ export default function App() {
   }
 
   return (
-    <div className="app">
+    <div className={`app ${!authUser ? 'app-auth-locked' : ''}`}>
       <header className="hero">
         <div>
           <p className="pill">AI Skin Check</p>
@@ -266,20 +584,67 @@ export default function App() {
             >
               {theme === 'light' ? 'Dark mode' : 'Light mode'}
             </button>
-            <button type="button" className="secondary-action" onClick={() => window.print()}>
-              Save result as PDF
+            <button
+              type="button"
+              className="secondary-action"
+              onClick={() => {
+                if (result?.pdf_cid) {
+                  window.open(`${IPFS_GATEWAY_BASE}${result.pdf_cid}`, '_blank', 'noopener,noreferrer')
+                  return
+                }
+                window.print()
+              }}
+            >
+              {result?.pdf_cid ? 'Download report PDF' : 'Save result as PDF'}
             </button>
           </div>
         </div>
-        <div className="hero-card">
-          <h3>Safety first</h3>
-          <ul>
-            <li>For education only — not medical advice.</li>
-            <li>Urgent symptoms need in-person care.</li>
-            <li>Protect your skin daily with SPF 30+.</li>
-          </ul>
-        </div>
+        {authUser && (
+          <div className="hero-card account-card">
+            <h3>Account</h3>
+            <p className="hint">Logged in as {authUser.email}</p>
+            <button type="button" className="secondary-action" onClick={handleLogout}>
+              Logout
+            </button>
+          </div>
+        )}
       </header>
+
+      {!authUser && (
+        <div className="auth-modal-backdrop" role="dialog" aria-modal="true" aria-label="Authentication required">
+          <div className="auth-modal-card">
+            <form className="auth-form auth-form-modal" onSubmit={handleAuthSubmit}>
+              <h4>{authMode === 'register' ? 'Create account' : 'Login'}</h4>
+              <p className="hint">Sign in to save and view your reports.</p>
+              <input
+                type="email"
+                value={authEmail}
+                onChange={(e) => setAuthEmail(e.target.value)}
+                placeholder="Email"
+                required
+              />
+              <input
+                type="password"
+                value={authPassword}
+                onChange={(e) => setAuthPassword(e.target.value)}
+                placeholder="Password"
+                required
+              />
+              <button type="submit" className="primary-action" disabled={authLoading}>
+                {authLoading ? 'Please wait...' : authMode === 'register' ? 'Register' : 'Login'}
+              </button>
+              <button
+                type="button"
+                className="history-toggle"
+                onClick={() => setAuthMode((prev) => (prev === 'register' ? 'login' : 'register'))}
+              >
+                {authMode === 'register' ? 'Already have an account? Login' : 'Need an account? Register'}
+              </button>
+              {authError && <p className="error">{authError}</p>}
+            </form>
+          </div>
+        </div>
+      )}
 
       <main className="layout">
         <section className="panel upload">
@@ -308,35 +673,6 @@ export default function App() {
                 <option value="clinical">Clinical</option>
                 <option value="dermoscopy">Dermoscopy</option>
               </select>
-            </div>
-
-            <div>
-              <p className="hint">Image quality checks (beta)</p>
-              <ul className="quality-list">
-                <li className={quality.face === 'yes' ? 'ok' : quality.face === 'no' ? 'warn' : ''}>
-                  {quality.face === 'yes'
-                    ? '✔ Face detected'
-                    : quality.face === 'no'
-                      ? '⚠ Face not detected'
-                      : '• Face detection not available'}
-                </li>
-                <li className={quality.lighting === 'good' ? 'ok' : quality.lighting === 'low' ? 'warn' : ''}>
-                  {quality.lighting === 'good'
-                    ? '✔ Adequate lighting'
-                    : quality.lighting === 'low'
-                      ? '⚠ Low lighting'
-                      : quality.lighting === 'high'
-                        ? '⚠ Very bright lighting'
-                        : '• Lighting check pending'}
-                </li>
-                <li className={quality.blur === 'sharp' ? 'ok' : quality.blur === 'blur' ? 'warn' : ''}>
-                  {quality.blur === 'sharp'
-                    ? '✔ Clear image'
-                    : quality.blur === 'blur'
-                      ? '⚠ Slight blur detected'
-                      : '• Blur check pending'}
-                </li>
-              </ul>
             </div>
 
             {skinCloseupWarning && (
@@ -386,8 +722,8 @@ export default function App() {
                 <h4>Session snapshot</h4>
                 <div className="snapshot-row">
                   <div>
-                    <strong>{history.length}</strong>
-                    <span>saved images</span>
+                    <strong>{reports.length}</strong>
+                    <span>saved reports</span>
                   </div>
                   <div>
                     <strong>{result ? '1' : '0'}</strong>
@@ -399,6 +735,117 @@ export default function App() {
                     {history.slice(0, 3).map((src) => (
                       <img key={src} src={src} alt="Recent upload" />
                     ))}
+                  </div>
+                )}
+                <div className="snapshot-footer">
+                  <button
+                    type="button"
+                    className="history-toggle"
+                    onClick={() => setShowFullHistory((prev) => !prev)}
+                  >
+                    {showFullHistory ? 'Hide full history' : 'Show full history'}
+                  </button>
+                </div>
+
+                {showFullHistory && (
+                  <div className="history-list" aria-label="Saved session history">
+                    {!reports.length && <p className="hint">No saved reports yet.</p>}
+
+                    {reports.map((entry) => {
+                      const key = `${entry.reportId}-${entry.timestamp}`
+                      const isOpen = !!openHistoryRows[entry.reportId]
+                      const verificationState = verificationByReportId[entry.reportId] || null
+                      const isVerifying = verificationState?.status === 'loading'
+
+                      return (
+                        <div key={key} className="history-item">
+                          <div className="history-row">
+                            <span className="history-time">{entry.timestamp || '—'}</span>
+                            <span className="history-id">{entry.reportId || '—'}</span>
+                            <button
+                              type="button"
+                              className="history-dropdown"
+                              onClick={() => toggleHistoryRow(entry.reportId)}
+                              aria-label={isOpen ? 'Collapse metadata' : 'Expand metadata'}
+                              aria-expanded={isOpen}
+                            >
+                              {isOpen ? '▾' : '▸'}
+                            </button>
+                          </div>
+
+                          {isOpen && (
+                            <div className="history-meta">
+                              <ul className="chain-list">
+                                <li>
+                                  <span>Report ID</span>
+                                  <strong>{entry.reportId || '—'}</strong>
+                                </li>
+                                <li>
+                                  <span>Timestamp</span>
+                                  <strong>{entry.timestamp || '—'}</strong>
+                                </li>
+                                <li>
+                                  <span>Model</span>
+                                  <strong>
+                                    {(entry.model?.name || '—')} ({entry.model?.version || '—'})
+                                  </strong>
+                                </li>
+                                <li>
+                                  <span>JSON CID</span>
+                                  {entry.json_cid ? (
+                                    <a href={IPFS_GATEWAY_BASE + entry.json_cid} target="_blank" rel="noreferrer">
+                                      {entry.json_cid}
+                                    </a>
+                                  ) : (
+                                    <strong>—</strong>
+                                  )}
+                                </li>
+                                <li>
+                                  <span>PDF CID</span>
+                                  {entry.pdf_cid ? (
+                                    <a href={IPFS_GATEWAY_BASE + entry.pdf_cid} target="_blank" rel="noreferrer">
+                                      {entry.pdf_cid}
+                                    </a>
+                                  ) : (
+                                    <strong>—</strong>
+                                  )}
+                                </li>
+                                <li>
+                                  <span>JSON Hash</span>
+                                  <strong className="mono">{entry.hash || '—'}</strong>
+                                </li>
+                                <li>
+                                  <span>Tx Hash</span>
+                                  {entry.tx_hash ? (
+                                    <a href={SEPOLIA_TX_BASE + entry.tx_hash} target="_blank" rel="noreferrer" className="mono">
+                                      {entry.tx_hash}
+                                    </a>
+                                  ) : (
+                                    <strong>—</strong>
+                                  )}
+                                </li>
+                              </ul>
+
+                              <div className="verify-row">
+                                <button
+                                  type="button"
+                                  className="secondary-action verify-button"
+                                  onClick={() => verifyHistoryReport(entry)}
+                                  disabled={isVerifying || !entry.json_cid}
+                                >
+                                  {isVerifying ? 'Verifying...' : 'Verify'}
+                                </button>
+                                {!!verificationState?.message && (
+                                  <p className={`verify-message ${verificationState.status || ''}`}>
+                                    {verificationState.message}
+                                  </p>
+                                )}
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      )
+                    })}
                   </div>
                 )}
               </div>
@@ -435,7 +882,6 @@ export default function App() {
         <section className="panel results">
           <div className="panel-header">
             <h2>Assessment</h2>
-            <span>Model output + wellness guidance</span>
           </div>
 
           {!result && (
@@ -502,10 +948,6 @@ export default function App() {
                     <h5>How to read this</h5>
                     <p className="muted">Top‑5 accuracy is more reliable for many classes. Low confidence means “inconclusive.”</p>
                   </div>
-                  <div className="micro-card">
-                    <h5>Next upload</h5>
-                    <p className="muted">Re‑capture in similar lighting to compare changes.</p>
-                  </div>
                 </div>
 
                 <div>
@@ -518,80 +960,11 @@ export default function App() {
                 </div>
 
                 <div>
-                  <h4>OTC suggestions</h4>
-                  <div className="disclaimer-badge">General wellness guidance — not a prescription</div>
-                  {result.guidance.otc_suggestions.length ? (
-                    <>
-                      <div className="otc-group">
-                        <h5>Daily care</h5>
-                        <ul>
-                          {result.guidance.otc_suggestions
-                            .filter((item) =>
-                              /sunscreen|moisturizer|cleanser/i.test(item)
-                            )
-                            .map((item) => (
-                              <li key={item}>{item}</li>
-                            ))}
-                        </ul>
-                      </div>
-                      <div className="otc-group">
-                        <h5>Relief</h5>
-                        <ul>
-                          {result.guidance.otc_suggestions
-                            .filter((item) => /compress|petrolatum/i.test(item))
-                            .map((item) => (
-                              <li key={item}>{item}</li>
-                            ))}
-                        </ul>
-                      </div>
-                      <div className="otc-group">
-                        <h5>Short-term</h5>
-                        <ul>
-                          {result.guidance.otc_suggestions
-                            .filter((item) => /hydrocortisone|antihistamine/i.test(item))
-                            .map((item) => (
-                              <li key={item}>{item}</li>
-                            ))}
-                        </ul>
-                      </div>
-                    </>
-                  ) : (
-                    <p>None recommended. Seek clinician guidance.</p>
-                  )}
-                </div>
-
-                <div>
                   <h4>Wellness tips</h4>
                   <ul>
                     {result.guidance.wellness_tips.map((tip) => (
                       <li key={tip}>{tip}</li>
                     ))}
-                  </ul>
-                </div>
-
-                <div>
-                  <h4>Image type</h4>
-                  <ul>
-                    <li>
-                      <span>
-                        Auto-detect: {result.modality?.label || 'unknown'}
-                        {typeof result.modality?.confidence === 'number'
-                          ? ` (${formatPercent(result.modality.confidence)})`
-                          : ''}
-                      </span>
-                      <strong>Route: {result.used_model}</strong>
-                    </li>
-                    {result.acne_stage?.label && result.acne_stage.label !== 'n/a' && (
-                      <li>
-                        <span>
-                          Stage‑1: {result.acne_stage.label.replace('_', ' ')}
-                          {typeof result.acne_stage.confidence === 'number'
-                            ? ` (${formatPercent(result.acne_stage.confidence)})`
-                            : ''}
-                        </span>
-                        <strong>Decision</strong>
-                      </li>
-                    )}
                   </ul>
                 </div>
               </div>
@@ -602,107 +975,63 @@ export default function App() {
                 ))}
               </div>
 
-              <div className="trackers-grid">
-                <div className="care-card">
-                  <h4>Skin care tracker</h4>
-                  <p className="hint">Simple daily checklist (local only)</p>
-                  <label className="check-row">
-                    <input type="checkbox" /> Gentle cleanse (AM/PM)
-                  </label>
-                  <label className="check-row">
-                    <input type="checkbox" /> Moisturizer applied
-                  </label>
-                  <label className="check-row">
-                    <input type="checkbox" /> SPF 30+ applied
-                  </label>
-                  <div className="chip-row">
-                    <span className="chip">AM</span>
-                    <span className="chip">PM</span>
-                    <span className="chip">Sensitive</span>
-                  </div>
-                </div>
-                <div className="care-card">
-                  <h4>Medication log</h4>
-                  <p className="hint">Track OTC use and reactions</p>
-                  <div className="log-row">
-                    <span>Hydrocortisone 1%</span>
-                    <span className="muted">2 days</span>
-                  </div>
-                  <div className="log-row">
-                    <span>Moisturizer</span>
-                    <span className="muted">daily</span>
-                  </div>
-                  <div className="log-row">
-                    <span>Sunscreen</span>
-                    <span className="muted">daily</span>
-                  </div>
-                </div>
-                <div className="care-card">
-                  <h4>Symptom timeline</h4>
-                  <div className="timeline">
-                    <div className="timeline-row">
-                      <span className="dot" />
-                      <div>
-                        <strong>Today</strong>
-                        <p className="muted">Redness + papules</p>
-                      </div>
-                    </div>
-                    <div className="timeline-row">
-                      <span className="dot" />
-                      <div>
-                        <strong>2 weeks ago</strong>
-                        <p className="muted">Mild irritation</p>
-                      </div>
-                    </div>
-                    <div className="timeline-row">
-                      <span className="dot" />
-                      <div>
-                        <strong>1 month ago</strong>
-                        <p className="muted">No symptoms</p>
-                      </div>
-                    </div>
-                  </div>
-                </div>
-                <div className="care-card">
-                  <h4>Photo tips</h4>
-                  <p className="hint">Keep angle and lighting consistent</p>
-                  <div className="photo-row">
-                    <div className="photo-thumb good">Even light</div>
-                    <div className="photo-thumb bad">Harsh glare</div>
-                  </div>
-                  <div className="chip-row">
-                    <span className="chip">No flash</span>
-                    <span className="chip">Same distance</span>
-                  </div>
-                </div>
-              </div>
-
-              <div className="care-grid">
-                <div className="care-card">
-                  <h4>When to seek care</h4>
-                  <p className="hint">Check any that apply. If yes, consider a clinician visit.</p>
-                  <label className="check-row">
-                    <input type="checkbox" /> Rapid change in size or color
-                  </label>
-                  <label className="check-row">
-                    <input type="checkbox" /> Bleeding, crusting, or ulceration
-                  </label>
-                  <label className="check-row">
-                    <input type="checkbox" /> Persistent pain or itching
-                  </label>
-                  <label className="check-row">
-                    <input type="checkbox" /> Irregular borders or asymmetry
-                  </label>
-                </div>
-                <div className="care-card">
-                  <h4>Follow-up plan</h4>
-                  <ul>
-                    <li>Recheck with a clearer photo in 2–4 weeks.</li>
-                    <li>Track changes in size, color, or texture.</li>
-                    <li>Use the same lighting for comparisons.</li>
-                  </ul>
-                  <div className="section-note">Tip: Save this result as PDF for your records.</div>
-                </div>
+              <div className="chain-card">
+                <h4>Blockchain report metadata</h4>
+                {result.persistence_status !== 'complete' ? (
+                  <p className="processing-note">processing transaction...</p>
+                ) : (
+                  <p className="hint">Verification status is intentionally not stored locally.</p>
+                )}
+                <ul className="chain-list">
+                  <li>
+                    <span>Report ID</span>
+                    <strong>{result.reportId || '—'}</strong>
+                  </li>
+                  <li>
+                    <span>Timestamp</span>
+                    <strong>{result.timestamp || '—'}</strong>
+                  </li>
+                  <li>
+                    <span>Model</span>
+                    <strong>
+                      {(result.model?.name || result.used_model || '—')} ({result.model?.version || result.model_version || '—'})
+                    </strong>
+                  </li>
+                  <li>
+                    <span>JSON CID</span>
+                    {result.json_cid ? (
+                      <a href={IPFS_GATEWAY_BASE + result.json_cid} target="_blank" rel="noreferrer">
+                        {result.json_cid}
+                      </a>
+                    ) : (
+                      <strong>—</strong>
+                    )}
+                  </li>
+                  <li>
+                    <span>PDF CID</span>
+                    {result.pdf_cid ? (
+                      <a href={IPFS_GATEWAY_BASE + result.pdf_cid} target="_blank" rel="noreferrer">
+                        {result.pdf_cid}
+                      </a>
+                    ) : (
+                      <strong>—</strong>
+                    )}
+                  </li>
+                  <li>
+                    <span>JSON Hash</span>
+                    <strong className="mono">{result.hash || '—'}</strong>
+                  </li>
+                  <li>
+                    <span>Tx Hash</span>
+                    {result.tx_hash ? (
+                      <a href={SEPOLIA_TX_BASE + result.tx_hash} target="_blank" rel="noreferrer" className="mono">
+                        {result.tx_hash}
+                      </a>
+                    ) : (
+                      <strong>—</strong>
+                    )}
+                  </li>
+                </ul>
               </div>
 
               <details>
