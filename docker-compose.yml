@@ -3,10 +3,15 @@ services:
     build: ./backend
     ports:
       - "5000:5000"
+    env_file:
+      - ./.env
     environment:
       MODEL_DIR: /app/model
+      APP_DB_PATH: /app/data/app.db
     volumes:
       - ./backend/model:/app/model
+      - ./backend/data:/app/data
+
   frontend:
     build: ./frontend
     ports:

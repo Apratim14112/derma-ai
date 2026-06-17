@@ -1,4 +1,4 @@
-# SkinWise — AI Skin Check (Demo)
+# Dermalyze (Demo)
 
 **Important:** This app is for educational purposes only and is **not** medical advice. Skin conditions can look similar. If you are concerned about a lesion, consult a licensed clinician.
 
